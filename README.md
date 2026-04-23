@@ -1,127 +1,177 @@
-# 网络流量日志分析 Agent Team
+# agent-debate-netsec
 
-基于 **AutoGen v0.4 + 通义千问 (Qwen)** 的多 agent 协作系统,完成 CCF BDCI 2019《企业网络资产及安全事件分析与可视化》两个任务。
+多 Agent 调查员辩论系统,解 CCF BDCI 2019 网络安全赛题。基于 **AutoGen v0.4 + 通义千问 Qwen3.6-plus + DuckDB**。
 
-## 架构
+**两份延伸阅读**:
+- 📘 [REPORT.md](REPORT.md) —— 正式实验报告(含架构图、全流程说明、辩论实录)
+- 📝 [BLOG.md](BLOG.md) —— 博客版叙述(设计思路 + 踩坑 + 意外收获)
 
-5 个 agent 在 `SelectorGroupChat` 里协作,LLM 根据对话自动挑下一个发言者:
+---
 
-| Agent | 职责 | 模型 |
-|---|---|---|
-| `DataEngineer` | 写 SQL、查数据、返回结果,不做主观判断 | qwen-turbo |
-| `AssetAnalyst` | 任务1:IP 角色识别、通信模式 | qwen-plus |
-| `ThreatHunter` | 任务2:异常通信、攻击链 | qwen-plus |
-| `Visualizer` | 出图(bar / time series / comm graph) | qwen-turbo |
-| `Critic` | 答辩评委,挑刺、追问证据 | qwen-plus |
+## 核心架构:3 个 agent,辩论式调查
 
-数据处理栈:**DuckDB + Parquet + pandas + matplotlib / networkx**。
+```
+Moderator (首席调查员)  — 提假设 / 裁决 / 换题 / 结案
+    ↓
+[并行开场] ProDebater (支持)  ‖  ConDebater (质疑)
+    ↓
+Moderator (Judge) → CONTINUE / REFRAME / VERDICT / DEBATE_DONE
+    ↓
+最终产出:1 个核心安全问题 + 资产/威胁清单 + 攻击链叙述
+```
+
+**每次 run 聚焦 1 个核心问题就结束**,不追求覆盖面。REFRAME 机制允许 Moderator 主动换题深挖。
+
+所有 agent 共享工具:
+- `run_sql` —— DuckDB SQL,查 tcpflow / flow 视图
+- `run_python` —— 进程内沙箱,预置 pandas / sklearn / ipaddress / user_agents / tldextract
+- `plot_bar` / `plot_time_series` / `build_comm_graph` —— matplotlib + networkx 可视化
 
 ## 目录
 
 ```
 agent_team/
-├── config.py              # Qwen 客户端 + 路径
-├── ingest.py              # raw → parquet(一次性)
+├── config.py             # Qwen client + 路径
+├── ingest.py             # raw JSON → Parquet
 ├── tools/
-│   ├── analysis.py        # run_sql / list_tables / profile_column
-│   └── viz.py             # plot_bar / plot_time_series / build_comm_graph
-├── agents/team.py         # 5 agent 定义 + SelectorGroupChat
-├── main_analyze.py        # 自动分析模式
-├── main_defend.py         # 答辩 Q&A 模式
-├── data_processed/        # parquet 缓存
-├── outputs/               # 图表
-└── transcripts/           # 每次对话的完整记录(JSONL)
+│   ├── analysis.py       # run_sql / list_tables / profile_column
+│   ├── python_exec.py    # run_python 沙箱
+│   └── viz.py            # 可视化工具
+├── agents/
+│   └── team.py           # DebateRunner + Moderator/Pro/Con
+├── main_analyze.py       # 自动分析模式(task=1 或 2)
+├── main_defend.py        # 答辩模式(用户直接提问)
+├── show_transcript.py    # 实时/回放对话查看器
+└── transcripts/          # 完整对话实录(JSONL)
 ```
 
 ## 安装
 
-需要 Python 3.10+(推荐 3.12)。用 `uv`(快)或 `pip` 都行。
+需要 **Python 3.10+**(推荐 3.12)。
 
 ```bash
-cd agent_team
-
-# 方式 A: uv(推荐)
-uv venv --python 3.12
+# uv(推荐)
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# 方式 B: pip
+# 或 pip
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# API key
+cp .env.example .env
+# 编辑 .env, 填 DASHSCOPE_API_KEY(从 https://bailian.console.aliyun.com/ 拿)
 ```
 
-配 API key:
+## 数据准备
+
+赛题数据从 [DataFountain 比赛页](https://www.datafountain.cn/competitions/358) 下载,放到:
+
+```
+大数据安全/
+├── agent_team/          # 本仓库
+├── 01资产识别/
+│   ├── dataset_1.zip          # 或解压后的 dataset_1/tcpflow/*.gz
+└── 02异常分析/
+    ├── part-1.json
+    └── part-2.json
+```
+
+然后入库(一次性,约 1-2 分钟):
 
 ```bash
-cp .env.example .env
-# 编辑 .env, 填入 DASHSCOPE_API_KEY (从 https://bailian.console.aliyun.com/ 拿)
+cd agent_team
+python ingest.py
+# 产出 data_processed/tcpflow.parquet 和 flow.parquet
 ```
 
 ## 运行
 
-### 1. 数据入库(一次性,~1-2 分钟)
-
-先确认 `../01资产识别/dataset_1.zip` 已解压出 `dataset_1/tcpflow/part-*.gz`,
-`../02异常分析/part-1.json`、`part-2.json` 已就位。
+### 自动分析模式(完整任务辩论)
 
 ```bash
-python ingest.py                    # 两个数据集都处理
-python ingest.py --only tcpflow     # 只处理任务1
-python ingest.py --only flow        # 只处理任务2
-python ingest.py --force            # 强制重建
+# Task 1 (资产识别,asset mode)
+python -u main_analyze.py --task 1 --max-messages 100
+
+# Task 2 (威胁检测,threat mode)
+python -u main_analyze.py --task 2 --max-messages 100
 ```
 
-产出:`data_processed/tcpflow.parquet`、`data_processed/flow.parquet`。
+每次跑会产生一份 `transcripts/<时间戳>-task{1,2}-*.jsonl` 对话记录。
 
-### 2. 自动分析模式
-
-让 agent team 自己讨论完成两个任务:
+### 答辩模式(单点深挖)
 
 ```bash
-python main_analyze.py              # 两个任务都跑
-python main_analyze.py --task 1     # 只任务1
-python main_analyze.py --task 2     # 只任务2
-python main_analyze.py --max-messages 60   # 放宽对话轮数上限
+python -u main_defend.py --mode threat -q "10.56.34.157 的 sqlmap 攻击具体危害多大?请量化证据。"
+
+# 或交互模式
+python -u main_defend.py
 ```
 
-输出:
-- 屏幕上实时看到每个 agent 的发言
-- `outputs/*.png` 自动生成的图
-- `transcripts/<时间戳>-task1-assets.jsonl` 完整对话记录
+defend 模式下,用户的问题**直接作为假设**,跳过 Moderator Pose 阶段,Pro/Con 直接开场。
 
-### 3. 答辩模式
-
-模拟老师提问,agent team 协作答辩:
+### 实时查看对话
 
 ```bash
-# 交互模式
-python main_defend.py
+# watch 模式:自动切换到最新 transcript
+python show_transcript.py -w
 
-# 单问
-python main_defend.py -q "为什么你认为 10.x.x.x 是数据库服务器?"
-python main_defend.py -q "你发现的 SQL 注入线索,证据链完整吗?"
+# 跟固定某份
+python show_transcript.py -f transcripts/20260423-170854-task1-assets.jsonl
+
+# 只看文字发言(不看思考/工具细节)
+python show_transcript.py -w --brief
+
+# 只看某个角色
+python show_transcript.py -w --only Moderator
 ```
 
-所有答辩对话都会存到 `transcripts/<时间戳>-defend.jsonl`,交作业时可以附上。
+## 仓库里的 3 份代表性 transcript
 
-## 报告素材
+| 文件 | 内容 |
+|---|---|
+| `transcripts/20260423-170854-task1-assets.jsonl` | **Task 1 双平面发现 + Task 2 CVE-2012-1823 RCE 扫描识别**(158 条,综合性最强) |
+| `transcripts/20260423-143813-task2-anomalies.jsonl` | **10.56.34.157 真实 sqlmap 攻击链发现**(82 条,Pro 按 UA 工具指纹切入) |
+| `transcripts/20260423-163111-task2-anomalies.jsonl` | **扫描器多维度分析 + H₃/H₄ 深度辩论**(95 条) |
 
-跑完之后交给老师的东西就在这几个目录:
+REPORT.md §7 有对应的精彩对话摘录。
 
-- `outputs/` — 所有图表
-- `transcripts/` — agent 讨论和答辩的完整记录(**论文亮点**:证明"这是真 multi-agent 协作,不是提示词糊的")
-- `data_processed/` — 中间数据(可复现)
+## 调优要点
 
-## 调参要点
+**Moderator 和稀泥判 benign 怎么办?**
+- 用 `--mode threat`(默认 threat)启用威胁场景 prompt
+- 或改 `agents/team.py` 的 `MODERATOR_SYSTEM`,强化调查员身份
 
-- **对话太长/太贵**:降 `--max-messages`,或把 `AssetAnalyst` / `ThreatHunter` 也换成 `qwen-turbo`(`config.py` 里改)
-- **数据太大模型 OOM**:`tools/analysis.py` 里 SQL 统一 `LIMIT`,preview 截断到 4k 字符,已经做了保护
-- **Critic 太激进导致死循环**:改小 `max_messages` 或在 `CRITIC_SYSTEM` 里放宽通过标准
-- **想换模型**:`config.py` 的 `QWEN_MODEL_HEAVY / QWEN_MODEL_LIGHT`,或直接在 `.env` 里设环境变量
+**对话超长烧 token?**
+- 降 `--max-messages`(默认 100,给 Moderator 深挖空间)
+- 或改 `DebateRunner(max_rebuttal_rounds=3)`,限反驳轮数
+
+**想换模型?**
+- `.env` 设 `QWEN_MODEL_HEAVY=qwen3.6-flash`(便宜 10 倍)
+- 或编辑 `config.py`
+
+**Python 沙箱里 agent 覆盖了 `con` 对象报 "flow table not found"?**
+- 下次调用会恢复,自愈
+- 长期解:让 `con` 在 namespace 里只读
 
 ## 故障排查
 
-- `tcpflow.parquet missing` → 先跑 `python ingest.py`
-- `DASHSCOPE_API_KEY not set` → `.env` 没配
-- ingest 报 JSON 解析错 → 检查原始数据文件完整性;`ingest.py` 已开 `ignore_errors=true` 会跳过坏行
+| 症状 | 原因 | 修 |
+|---|---|---|
+| `DASHSCOPE_API_KEY not set` | `.env` 没配 | 按 .env.example 填 |
+| `tcpflow.parquet missing` | 还没 ingest | `python ingest.py` |
+| ingest 报 `malformed JSON` | flow 数据分隔符奇怪 | 代码已处理(brace-aware);如新格式可能要改 `ingest.py` |
+| agent 连接错误 | 网络抖 / 账户欠费 | `_call_once` 自动重试 3 次;仍失败检查 Dashscope 账单 |
+| 对话卡很久不动 | Python `print` 写到文件被 block buffered,实际在跑 | 看 transcript 文件本身(`show_transcript.py`) |
+
+## 许可证
+
+MIT License. 见 [LICENSE](LICENSE)。
+
+## 引用 / 致谢
+
+本项目是 CCF BDCI 2019 赛题 13 的作业尝试。架构的迭代与调试,详见 [BLOG.md](BLOG.md) 的全过程记录。
+
+核心思路灵感来自对"单 agent LLM 模式匹配陷阱"的观察,以及对"多 agent 辩论常陷入和稀泥"的反思。最终版本采用**调查员(Investigator)**身份而非**法官(Judge)**,显著提升了结论的判断力。
