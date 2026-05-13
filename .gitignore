@@ -8,10 +8,11 @@ outputs/*
 !outputs/.gitkeep
 !data_processed/.gitkeep
 
-# transcripts: ignore all except the 3 report-cited runs
+# transcripts: ignore all except the report-cited runs
 transcripts/*
 !transcripts/.gitkeep
 !transcripts/20260423-170854-task1-assets.jsonl
 !transcripts/20260423-143813-task2-anomalies.jsonl
 !transcripts/20260423-163111-task2-anomalies.jsonl
+!transcripts/20260514-002600-defend.jsonl
 
